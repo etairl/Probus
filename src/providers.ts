@@ -1,8 +1,14 @@
-// Maps between probus concepts and opencode's "<providerID>/<modelID>" model slugs.
+// Maps between probus model slugs ("<providerID>/<modelID>") and the
+// Claude Agent SDK, which only speaks the Anthropic wire protocol.
 //
-// We intentionally keep the list small — openai, openrouter, anthropic — because
-// those are the ones we have defaults for. Any other opencode providerID will
-// still work as long as the matching *_API_KEY env var is set.
+// Providers are supported by swapping `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`
+// at subprocess-spawn time:
+//   - anthropic  → native
+//   - openrouter → ANTHROPIC_BASE_URL=https://openrouter.ai/api
+//   - openai     → spawn Bifrost (Anthropic→OpenAI translator) and point
+//                  ANTHROPIC_BASE_URL at http://127.0.0.1:<port>
+
+import { ensureBifrost } from './bifrost.js';
 
 export type KnownProvider = 'openai' | 'openrouter' | 'anthropic';
 
@@ -75,4 +81,59 @@ export function defaultModels(provider: KnownProvider): ModelDefaults {
         qa: 'anthropic/claude-opus-4.7',
       };
   }
+}
+
+export interface ProviderRuntime {
+  /** Extra env vars to inject into the Claude Code subprocess. */
+  env: Record<string, string | undefined>;
+  /** Model name as Claude Code expects it (provider prefix usually stripped). */
+  modelForSDK: string;
+}
+
+/**
+ * Given a model slug, resolve how to run it against the Claude Agent SDK:
+ * which `ANTHROPIC_*` env vars to set and which model name to pass through.
+ *
+ * Callers must already have the provider's *_API_KEY in process.env (the UI
+ * prompts for it before we get here).
+ */
+export async function resolveProviderConfig(slug: string): Promise<ProviderRuntime> {
+  const { providerID, modelID } = splitModel(slug);
+  const keyVar = envVarForProvider(providerID);
+  const apiKey = process.env[keyVar];
+  if (!apiKey) {
+    throw new Error(`${keyVar} is not set — required for provider "${providerID}"`);
+  }
+
+  if (providerID === 'anthropic') {
+    return {
+      env: { ANTHROPIC_API_KEY: apiKey },
+      modelForSDK: modelID,
+    };
+  }
+
+  if (providerID === 'openrouter') {
+    return {
+      env: {
+        ANTHROPIC_API_KEY: apiKey,
+        ANTHROPIC_BASE_URL: 'https://openrouter.ai/api',
+      },
+      modelForSDK: modelID,
+    };
+  }
+
+  if (providerID === 'openai') {
+    const baseURL = await ensureBifrost(apiKey);
+    return {
+      env: {
+        // Bifrost doesn't check this, but the SDK/CLI insists on a non-empty value.
+        ANTHROPIC_API_KEY: 'bifrost-dummy',
+        ANTHROPIC_BASE_URL: baseURL,
+      },
+      // Bifrost uses the provider-prefixed slug to route to OpenAI.
+      modelForSDK: slug,
+    };
+  }
+
+  throw new Error(`Unsupported provider: ${providerID}`);
 }

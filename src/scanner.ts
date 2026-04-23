@@ -1,8 +1,8 @@
 import { execSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync } from 'node:fs';
 import path from 'node:path';
-import { runOpencodeAgent } from './opencode.js';
-import { splitModel, envVarForProvider } from './providers.js';
+import { runClaudeAgent } from './claude-agent.js';
+import { resolveProviderConfig } from './providers.js';
 
 export interface Finding {
   name: string;
@@ -149,9 +149,10 @@ export function validateFindings(json: string): FileFindings {
   return obj as FileFindings;
 }
 
-// Runs a one-shot prompt against opencode. `model` is a slug like
+// Runs a one-shot prompt against the Claude Agent SDK. `model` is a slug like
 // "openai/gpt-5.4" or "openrouter/qwen/qwen3.6-plus". The API key is pulled
-// from the matching env var (e.g. OPENAI_API_KEY, OPENROUTER_API_KEY).
+// from the matching env var (e.g. OPENAI_API_KEY, OPENROUTER_API_KEY), and
+// the request is routed via ANTHROPIC_BASE_URL or a spawned Bifrost gateway.
 async function* runAgent(
   prompt: string,
   cwd: string,
@@ -161,30 +162,27 @@ async function* runAgent(
   stageLabel?: string,
 ): AsyncGenerator<
   | { type: 'chunk'; text: string }
+  | { type: 'usage'; tokens: number }
   | { type: 'done'; code: number }
   | { type: 'skipped' }
   | { type: 'error'; text: string }
 > {
-  let providerID: string;
-  let modelID: string;
+  let runtime: Awaited<ReturnType<typeof resolveProviderConfig>>;
   try {
-    const parsed = splitModel(model);
-    providerID = parsed.providerID;
-    modelID = parsed.modelID;
+    runtime = await resolveProviderConfig(model);
   } catch (err) {
-    yield { type: 'error', text: String(err) };
+    yield { type: 'error', text: err instanceof Error ? err.message : String(err) };
     return;
   }
 
-  const envVar = envVarForProvider(providerID);
-  const apiKey = process.env[envVar];
-  if (!apiKey) {
-    yield { type: 'error', text: `${envVar} is not set — required for provider "${providerID}"` };
-    return;
-  }
-
-  for await (const ev of runOpencodeAgent({
-    prompt, cwd, providerID, modelID, apiKey, signal, logFile, stageLabel,
+  for await (const ev of runClaudeAgent({
+    prompt,
+    cwd,
+    model: runtime.modelForSDK,
+    env: runtime.env,
+    signal,
+    logFile,
+    stageLabel,
   })) {
     yield ev;
   }
@@ -337,6 +335,7 @@ export async function* runAnalyst(
   const logFile = path.join(outputDir, 'debug', 'analyst.log');
   for await (const ev of runAgent(prompt, repoPath, model, signal, logFile, 'analyst')) {
     if (ev.type === 'chunk') yield { type: 'chunk', text: ev.text };
+    else if (ev.type === 'usage') yield { type: 'usage', tokens: ev.tokens };
     else if (ev.type === 'skipped') { yield { type: 'skipped' }; return; }
     else if (ev.type === 'error') { yield { type: 'error', text: ev.text }; return; }
     else if (ev.type === 'done' && ev.code !== 0) {
@@ -387,6 +386,7 @@ export async function* scanAndVerify(
 
   for await (const ev of runAgent(researcherPrompt(absFile, jsonPath), repoPath, researcherModel, signal, logFile, 'researcher')) {
     if (ev.type === 'chunk') yield { type: 'chunk', text: ev.text };
+    else if (ev.type === 'usage') yield { type: 'usage', tokens: ev.tokens };
     else if (ev.type === 'skipped') { yield { type: 'skipped' }; return; }
     else if (ev.type === 'error') { yield { type: 'error', text: ev.text }; return; }
     else if (ev.type === 'done' && ev.code !== 0) {
@@ -423,6 +423,7 @@ export async function* scanAndVerify(
   const reportSlug = fileSlug(file);
   for await (const ev of runAgent(qaPrompt(absFile, jsonPath, reportsPath, reportSlug), repoPath, qaModel, signal, logFile, 'qa')) {
     if (ev.type === 'chunk') yield { type: 'chunk', text: ev.text };
+    else if (ev.type === 'usage') yield { type: 'usage', tokens: ev.tokens };
     else if (ev.type === 'skipped') { yield { type: 'skipped' }; return; }
     else if (ev.type === 'error') { yield { type: 'error', text: ev.text }; return; }
     else if (ev.type === 'done' && ev.code !== 0) {

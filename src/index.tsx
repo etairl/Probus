@@ -3,18 +3,18 @@ import { render } from 'ink';
 import { App } from './ui/App.js';
 import { loadDotenv } from './env.js';
 import { parseArgs, HELP_TEXT } from './cli.js';
-import { shutdownOpencode } from './opencode.js';
+import { shutdownBifrost } from './bifrost.js';
 
 loadDotenv();
 
 const parsed = parseArgs(process.argv.slice(2));
 
 const shutdown = () => {
-  shutdownOpencode().catch(() => { /* ignore */ }).finally(() => process.exit(0));
+  shutdownBifrost().catch(() => { /* ignore */ }).finally(() => process.exit(0));
 };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
-process.on('exit', () => { void shutdownOpencode(); });
+process.on('exit', () => { void shutdownBifrost(); });
 
 switch (parsed.kind) {
   case 'help':

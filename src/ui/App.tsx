@@ -21,7 +21,8 @@ import {
   splitModel,
   type KnownProvider,
 } from '../providers.js';
-import { shutdownOpencode } from '../opencode.js';
+// Bifrost lifecycle (spawn/shutdown) is owned by index.tsx; App.tsx doesn't
+// manage subprocesses directly anymore.
 
 type FileStatus =
   | 'pending'
@@ -39,7 +40,9 @@ interface FileEntry {
   realFindings?: number;
 }
 
-type Phase = 'api-key' | 'analyst' | 'scanning' | 'done' | 'browse';
+type Phase = 'provider-select' | 'api-key' | 'analyst' | 'scanning' | 'done' | 'browse';
+
+const PROVIDER_CHOICES: readonly KnownProvider[] = ['openrouter', 'openai', 'anthropic'];
 
 export type Effort = 'low' | 'medium' | 'high';
 export const EFFORT_FILE_LIMIT: Record<Effort, number> = { low: 50, medium: 100, high: 500 };
@@ -61,14 +64,12 @@ const PROVIDER_LABEL: Record<KnownProvider, string> = {
 };
 
 /**
- * Decide which provider we will use and which env var holds its key.
- * If `preferredProvider` is set, we always use that provider (even if its
- * key isn't set yet — we'll prompt for it). Otherwise we try to detect one
- * from the environment, and fall back to openrouter for the prompt.
+ * Initial provider choice. `null` means "no preference and nothing detected"
+ * — the UI will show a selector so the user can pick one and enter its key.
  */
-function resolveActiveProvider(preferred: KnownProvider | null | undefined): KnownProvider {
+function resolveInitialProvider(preferred: KnownProvider | null | undefined): KnownProvider | null {
   if (preferred) return preferred;
-  return detectProvider() ?? 'openrouter';
+  return detectProvider();
 }
 
 const ICON: Record<FileStatus, string> = {
@@ -98,11 +99,11 @@ const SEVERITY_COLOR: Record<string, string> = {
 
 function statusLabel(f: FileEntry): string {
   switch (f.status) {
-    case 'scanning': return 'scanning';
-    case 'verifying': return `found ${f.totalFindings ?? 0} — verifying`;
+    case 'scanning': return 'scanning..';
+    case 'verifying': return `${f.totalFindings ?? 0} potential vulnerabilities — verifying..`;
     case 'done':
       if (f.totalFindings === undefined) return 'done';
-      return `${f.realFindings ?? 0} real / ${f.totalFindings} found`;
+      return `${f.realFindings ?? 0} verified / ${f.totalFindings} potential vulnerabilities`;
     case 'error': return 'error';
     case 'skipped': return 'skipped';
     default: return '';
@@ -121,22 +122,31 @@ export function App({
   parallel = 1,
 }: Props) {
   const { exit } = useApp();
-  const activeProvider = resolveActiveProvider(preferredProvider);
-  const activeEnvVar = envVarForProvider(activeProvider);
+
+  // Provider selection: if --provider was passed or any *_API_KEY is set,
+  // we already know which provider to use. Otherwise it's null and we ask
+  // the user to pick one from a menu.
+  const initialProvider = resolveInitialProvider(preferredProvider);
+  const [chosenProvider, setChosenProvider] = useState<KnownProvider | null>(initialProvider);
+  const [providerCursor, setProviderCursor] = useState<number>(() => {
+    const i = PROVIDER_CHOICES.indexOf(initialProvider ?? 'openrouter');
+    return i === -1 ? 0 : i;
+  });
+
+  // Until the user picks a provider, models fall back to openrouter defaults
+  // just so the screen has something to render — the scan doesn't actually
+  // start until chosenProvider !== null.
+  const activeProvider: KnownProvider = chosenProvider ?? 'openrouter';
   const defaults = defaultModels(activeProvider);
   const researcherModel = researcherModelProp ?? defaults.researcher;
   const qaModel = qaModelProp ?? defaults.qa;
 
-  // We need keys for whichever providers the two models point at. In the
-  // simple single-provider case they collapse to one. If a user passes a
-  // custom slug on a different provider, we still only prompt for the one
-  // we know how to ask about here — the other will surface as an opencode
-  // auth error, which is acceptable for now.
+  // Providers whose keys we need. Collapses to one in the common case.
   const requiredProviders = new Set<string>();
   try { requiredProviders.add(splitModel(researcherModel).providerID); } catch { /* invalid slug surfaces later */ }
   try { requiredProviders.add(splitModel(qaModel).providerID); } catch { /* ignore */ }
   requiredProviders.add(activeProvider);
-  const missingProviderKey = mode === 'scan'
+  const missingProviderKey = mode === 'scan' && chosenProvider
     ? [...requiredProviders].find(p => !process.env[envVarForProvider(p)])
     : undefined;
   const needsKey = Boolean(missingProviderKey);
@@ -144,9 +154,11 @@ export function App({
   const promptEnvVar = envVarForProvider(promptProvider);
   const promptLabel = (PROVIDER_LABEL as Record<string, string>)[promptProvider] ?? promptProvider;
 
-  const [phase, setPhase] = useState<Phase>(
-    mode === 'view' ? 'browse' : needsKey ? 'api-key' : 'analyst',
-  );
+  const [phase, setPhase] = useState<Phase>(() => {
+    if (mode === 'view') return 'browse';
+    if (chosenProvider === null) return 'provider-select';
+    return needsKey ? 'api-key' : 'analyst';
+  });
   const [keyInput, setKeyInput] = useState('');
   const [keyError, setKeyError] = useState<string | null>(null);
   const [analystThought, setAnalystThought] = useState<string>('');
@@ -159,7 +171,6 @@ export function App({
   const [reportContent, setReportContent] = useState<string>('');
   const [viewIdx, setViewIdx] = useState<number | null>(null);
   const [tokens, setTokens] = useState(0);
-  const [resumedFindings, setResumedFindings] = useState(0);
   const running = useRef(false);
   const skipSignal = useRef<AbortController | null>(null);
   // Per-file abort controllers during parallel scanning. `s` aborts whatever
@@ -172,6 +183,27 @@ export function App({
   const cacheFile = path.join(outputDir, 'processed-files.txt');
 
   useInput((input, key) => {
+    if (phase === 'provider-select') {
+      if (key.ctrl && input === 'c') { exit(); return; }
+      if (key.upArrow || input === 'k') {
+        setProviderCursor(c => Math.max(0, c - 1));
+        return;
+      }
+      if (key.downArrow || input === 'j') {
+        setProviderCursor(c => Math.min(PROVIDER_CHOICES.length - 1, c + 1));
+        return;
+      }
+      if (key.return) {
+        const picked = PROVIDER_CHOICES[providerCursor];
+        setChosenProvider(picked);
+        // If the user already has that provider's key in env, skip straight
+        // to the scan; otherwise prompt for it.
+        const keyPresent = !!process.env[envVarForProvider(picked)];
+        setPhase(keyPresent ? 'analyst' : 'api-key');
+        return;
+      }
+      return;
+    }
     if (phase === 'api-key') {
       if (key.ctrl && input === 'c') { exit(); return; }
       if (key.return) {
@@ -238,7 +270,7 @@ export function App({
 
   useEffect(() => {
     if (running.current) return;
-    if (phase === 'api-key') return;
+    if (phase === 'api-key' || phase === 'provider-select') return;
     running.current = true;
 
     if (mode === 'view') {
@@ -261,12 +293,8 @@ export function App({
       try {
         ensureOutputDir(outputDir);
 
-        // If this is a resumed run, prime the "vulnerabilities" counter with
-        // whatever was already verified on disk so the user sees continuity
-        // instead of watching it start at 0.
-        try {
-          setResumedFindings(listVerifiedReports(outputDir).length);
-        } catch { /* non-fatal */ }
+        // Counter starts at 0 each scan — existing reports on disk are only
+        // surfaced in `probus view`, not mixed into the live scan progress.
 
         skipSignal.current = new AbortController();
         let paths: string[] | null = null;
@@ -399,6 +427,30 @@ export function App({
     return <Text color="red">Fatal: {fatalError}</Text>;
   }
 
+  if (phase === 'provider-select') {
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Text bold color="cyan">Probus</Text>
+        <Text color="gray">No API key detected. Pick a provider:</Text>
+        <Box flexDirection="column">
+          {PROVIDER_CHOICES.map((p, i) => {
+            const isSel = i === providerCursor;
+            return (
+              <Box key={p} gap={1}>
+                <Text color={isSel ? 'cyan' : 'gray'}>{isSel ? '▶' : ' '}</Text>
+                <Text color={isSel ? 'white' : 'gray'} bold={isSel}>
+                  {PROVIDER_LABEL[p]}
+                </Text>
+                <Text color="gray" dimColor>— {envVarForProvider(p)}</Text>
+              </Box>
+            );
+          })}
+        </Box>
+        <Text color="gray" dimColor>↑↓ navigate   ↵ select   ctrl+c quit</Text>
+      </Box>
+    );
+  }
+
   if (phase === 'api-key') {
     return (
       <Box flexDirection="column" gap={1}>
@@ -484,7 +536,7 @@ export function App({
   }
 
   const realTotal =
-    resumedFindings + files.reduce((sum, f) => sum + (f.realFindings ?? 0), 0);
+    files.reduce((sum, f) => sum + (f.realFindings ?? 0), 0);
   const processedCount = files.filter(f =>
     f.status === 'done' || f.status === 'skipped' || f.status === 'error',
   ).length;
@@ -513,7 +565,7 @@ export function App({
         <Box flexDirection="column">
           <Text color="yellow">⚡ Learning repo…</Text>
           <Box paddingLeft={3}>
-            <Text color="gray" dimColor>Mapping out files to create a pentest plan..</Text>
+            <Text color="gray" dimColor>Mapping out files to create a vulnerability assessment plan..</Text>
           </Box>
           {analystThought && (
             <Box paddingLeft={3}>
@@ -539,10 +591,10 @@ export function App({
                   <Text color={isSelected ? 'cyan' : 'gray'}>{isSelected ? '▶' : ' '}</Text>
                   <Text color={COLOR[f.status]}>{ICON[f.status]}</Text>
                   <Text color={isSelected ? 'white' : 'gray'} bold={isProcessing}>{f.path}</Text>
-                  {total !== undefined && (
-                    <Text color="magenta">— {real ?? 0} verified / {total} found</Text>
+                  {f.status === 'done' && total !== undefined && (
+                    <Text color="magenta">— {real ?? 0} verified / {total} potential vulnerabilities</Text>
                   )}
-                  {total === undefined && label && (
+                  {f.status !== 'done' && label && (
                     <Text color={COLOR[f.status]} dimColor={!isSelected}>— {label}</Text>
                   )}
                 </Box>
@@ -568,7 +620,7 @@ export function App({
           </>
         )}
         {(phase === 'analyst' || phase === 'scanning') && (
-          <Text color="blue">tokens: {tokensDisplay}</Text>
+          <Text color="blue">↓ tokens: {tokensDisplay}</Text>
         )}
         {phase === 'analyst' && <Text color="gray" dimColor>q quit</Text>}
         {phase === 'scanning' && <Text color="gray" dimColor>↑↓ navigate  s skip  q quit</Text>}

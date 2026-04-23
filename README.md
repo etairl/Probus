@@ -6,6 +6,8 @@
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](.nvmrc)
 [![CI](https://github.com/ItayRosen/Probus/actions/workflows/ci.yml/badge.svg)](https://github.com/ItayRosen/Probus/actions/workflows/ci.yml)
 
+![Probus scanning a repo](./docs/screenshot.png)
+
 ---
 
 ## What it does
