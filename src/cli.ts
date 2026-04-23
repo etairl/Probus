@@ -12,9 +12,12 @@ export type ParsedArgs =
       qaModel: string | null;
       effort: Effort;
       preferredProvider: KnownProvider | null; // from --provider or null = detect
+      parallel: number; // how many files to scan concurrently (default 1)
     };
 
 export const DEFAULT_EFFORT: Effort = 'low';
+export const DEFAULT_PARALLEL = 1;
+const MAX_PARALLEL = 16;
 
 const EFFORTS: ReadonlySet<Effort> = new Set<Effort>(['low', 'medium', 'high']);
 const PROVIDERS: ReadonlySet<string> = new Set(['openai', 'openrouter', 'anthropic']);
@@ -28,6 +31,7 @@ export function parseArgs(rawArgs: string[]): ParsedArgs {
   let researcherModel: string | null = null;
   let qaModel: string | null = null;
   let preferredProvider: KnownProvider | null = null;
+  let parallel: number = DEFAULT_PARALLEL;
   const positional: string[] = [];
 
   const takeValue = (flag: string, i: number): [string, number] | string => {
@@ -68,6 +72,16 @@ export function parseArgs(rawArgs: string[]): ParsedArgs {
       }
       preferredProvider = v as KnownProvider;
       i = next;
+    } else if (a === '--parallel' || a.startsWith('--parallel=')) {
+      const r = takeValue('--parallel', i);
+      if (typeof r === 'string') return { kind: 'error', message: r };
+      const [v, next] = r;
+      const n = Number.parseInt(v, 10);
+      if (!Number.isFinite(n) || n < 1 || n > MAX_PARALLEL) {
+        return { kind: 'error', message: `Invalid --parallel value: ${v}. Must be an integer between 1 and ${MAX_PARALLEL}.` };
+      }
+      parallel = n;
+      i = next;
     } else if (a.startsWith('--')) {
       return { kind: 'error', message: `Unknown flag: ${a}` };
     } else {
@@ -86,7 +100,7 @@ export function parseArgs(rawArgs: string[]): ParsedArgs {
     if (!repo) {
       return { kind: 'error', message: 'Usage: probus scan <repo-path> [--effort ...] [--researchModel ...] [--qaModel ...]' };
     }
-    return { kind: 'scan', repo, researcherModel, qaModel, effort, preferredProvider };
+    return { kind: 'scan', repo, researcherModel, qaModel, effort, preferredProvider, parallel };
   }
 
   return { kind: 'error', message: `Unknown command: ${cmd ?? '(missing)'}` };
@@ -105,7 +119,7 @@ export function resolveDefaults(
 
 export const HELP_TEXT = [
   'Usage:',
-  '  probus scan <repo-path> [--effort low|medium|high] [--researchModel slug] [--qaModel slug] [--provider openai|openrouter|anthropic]',
+  '  probus scan <repo-path> [--effort low|medium|high] [--researchModel slug] [--qaModel slug] [--provider openai|openrouter|anthropic] [--parallel N]',
   '  probus view <repo-path>',
   '',
   'Model slugs are "<providerID>/<modelID>", e.g. "openai/gpt-5.4" or',
@@ -116,4 +130,6 @@ export const HELP_TEXT = [
   '',
   'Effort controls how many files the analyst targets:',
   '  low (default) ≈ 50 files   medium ≈ 100   high ≈ 500',
+  '',
+  '--parallel N runs N files through researcher+QA concurrently (default 1, max 16).',
 ].join('\n');

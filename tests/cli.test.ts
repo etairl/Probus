@@ -28,7 +28,30 @@ describe('parseArgs', () => {
       qaModel: null,
       effort: 'low',
       preferredProvider: null,
+      parallel: 1,
     });
+  });
+
+  it('accepts --parallel 4', () => {
+    const r = parseArgs(['scan', '../repo', '--parallel', '4']);
+    expect(r.kind === 'scan' && r.parallel).toBe(4);
+  });
+
+  it('accepts --parallel=8', () => {
+    const r = parseArgs(['scan', '--parallel=8', '../repo']);
+    expect(r.kind === 'scan' && r.parallel).toBe(8);
+  });
+
+  it('rejects --parallel 0', () => {
+    expect(parseArgs(['scan', '../repo', '--parallel', '0']).kind).toBe('error');
+  });
+
+  it('rejects --parallel non-integer', () => {
+    expect(parseArgs(['scan', '../repo', '--parallel', 'lots']).kind).toBe('error');
+  });
+
+  it('rejects --parallel above max', () => {
+    expect(parseArgs(['scan', '../repo', '--parallel', '999']).kind).toBe('error');
   });
 
   it('parses --researchModel / --qaModel flags', () => {

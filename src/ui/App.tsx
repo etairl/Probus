@@ -51,6 +51,7 @@ interface Props {
   mode?: 'scan' | 'view';
   effort?: Effort;
   preferredProvider?: KnownProvider | null;
+  parallel?: number;
 }
 
 const PROVIDER_LABEL: Record<KnownProvider, string> = {
@@ -117,6 +118,7 @@ export function App({
   mode = 'scan',
   effort = 'low',
   preferredProvider = null,
+  parallel = 1,
 }: Props) {
   const { exit } = useApp();
   const activeProvider = resolveActiveProvider(preferredProvider);
@@ -157,8 +159,12 @@ export function App({
   const [reportContent, setReportContent] = useState<string>('');
   const [viewIdx, setViewIdx] = useState<number | null>(null);
   const [tokens, setTokens] = useState(0);
+  const [resumedFindings, setResumedFindings] = useState(0);
   const running = useRef(false);
   const skipSignal = useRef<AbortController | null>(null);
+  // Per-file abort controllers during parallel scanning. `s` aborts whatever
+  // the user is currently focused on (viewIdx ?? currentIdx).
+  const fileAborts = useRef<Map<number, AbortController>>(new Map());
 
   const repoPath = path.resolve(targetRepo);
   const repoSlug = `${path.basename(repoPath).replace(/[^a-zA-Z0-9._-]/g, '_') || 'repo'}-${createHash('sha1').update(repoPath).digest('hex').slice(0, 8)}`;
@@ -187,7 +193,11 @@ export function App({
     }
     if (input === 'q') { exit(); return; }
     if (phase === 'scanning') {
-      if (input === 's') skipSignal.current?.abort();
+      if (input === 's') {
+        // Skip the focused file (under the ▶ cursor), not every in-flight one.
+        const focus = viewIdx ?? currentIdx;
+        fileAborts.current.get(focus)?.abort();
+      }
       if (key.upArrow || input === 'k') {
         setViewIdx(v => {
           const base = v ?? currentIdx;
@@ -251,6 +261,13 @@ export function App({
       try {
         ensureOutputDir(outputDir);
 
+        // If this is a resumed run, prime the "vulnerabilities" counter with
+        // whatever was already verified on disk so the user sees continuity
+        // instead of watching it start at 0.
+        try {
+          setResumedFindings(listVerifiedReports(outputDir).length);
+        } catch { /* non-fatal */ }
+
         skipSignal.current = new AbortController();
         let paths: string[] | null = null;
 
@@ -281,57 +298,66 @@ export function App({
         setFiles(initial);
         setPhase('scanning');
 
-        for (let i = 0; i < initial.length; i++) {
-          setCurrentIdx(i);
-          if (initial[i].status === 'skipped') continue;
+        // Worker-pool: up to `parallel` files stream through scanAndVerify
+        // concurrently. Each worker claims the next non-skipped index via a
+        // shared cursor. UI state is updated per-file using the captured index,
+        // so interleaved updates stay correct.
+        let cursor = 0;
+        const runOne = async (i: number) => {
+          setCurrentIdx(prev => (i > prev ? i : prev));
 
-          skipSignal.current = new AbortController();
+          const ac = new AbortController();
+          fileAborts.current.set(i, ac);
           let finalStatus: FileStatus = 'done';
           let totalFindings: number | undefined;
           let realFindings: number | undefined;
 
-          for await (const ev of scanAndVerify(
-            initial[i].path, repoPath, outputDir, researcherModel, qaModel, skipSignal.current.signal,
-          )) {
-            if (ev.type === 'chunk') {
-              const lines = ev.text.split('\n').map(l => l.trim()).filter(Boolean);
-              if (lines.length > 0) {
-                const last = lines[lines.length - 1];
+          try {
+            for await (const ev of scanAndVerify(
+              initial[i].path, repoPath, outputDir, researcherModel, qaModel, ac.signal,
+            )) {
+              if (ev.type === 'chunk') {
+                const lines = ev.text.split('\n').map(l => l.trim()).filter(Boolean);
+                if (lines.length > 0) {
+                  const last = lines[lines.length - 1];
+                  setFiles(prev => {
+                    const next = [...prev];
+                    next[i] = { ...next[i], lastThought: last };
+                    return next;
+                  });
+                }
+              } else if (ev.type === 'usage') {
+                setTokens(t => t + ev.tokens);
+              } else if (ev.type === 'stage') {
+                const s: FileStatus = ev.stage === 'scanning' ? 'scanning' : 'verifying';
                 setFiles(prev => {
                   const next = [...prev];
-                  next[i] = { ...next[i], lastThought: last };
+                  next[i] = { ...next[i], status: s };
                   return next;
                 });
+              } else if (ev.type === 'findings') {
+                totalFindings = ev.count;
+                setFiles(prev => {
+                  const next = [...prev];
+                  next[i] = { ...next[i], totalFindings: ev.count };
+                  return next;
+                });
+              } else if (ev.type === 'verified') {
+                totalFindings = ev.total;
+                realFindings = ev.real;
+                setFiles(prev => {
+                  const next = [...prev];
+                  next[i] = { ...next[i], totalFindings: ev.total, realFindings: ev.real };
+                  return next;
+                });
+              } else if (ev.type === 'skipped') {
+                finalStatus = 'skipped';
+              } else if (ev.type === 'error') {
+                finalStatus = 'error';
               }
-            } else if (ev.type === 'usage') {
-              setTokens(t => t + ev.tokens);
-            } else if (ev.type === 'stage') {
-              const s: FileStatus = ev.stage === 'scanning' ? 'scanning' : 'verifying';
-              setFiles(prev => {
-                const next = [...prev];
-                next[i] = { ...next[i], status: s };
-                return next;
-              });
-            } else if (ev.type === 'findings') {
-              totalFindings = ev.count;
-              setFiles(prev => {
-                const next = [...prev];
-                next[i] = { ...next[i], totalFindings: ev.count };
-                return next;
-              });
-            } else if (ev.type === 'verified') {
-              totalFindings = ev.total;
-              realFindings = ev.real;
-              setFiles(prev => {
-                const next = [...prev];
-                next[i] = { ...next[i], totalFindings: ev.total, realFindings: ev.real };
-                return next;
-              });
-            } else if (ev.type === 'skipped') {
-              finalStatus = 'skipped';
-            } else if (ev.type === 'error') {
-              finalStatus = 'error';
             }
+          } finally {
+            fileAborts.current.delete(i);
           }
 
           setFiles(prev => {
@@ -345,7 +371,19 @@ export function App({
             return next;
           });
           if (finalStatus === 'done') markCached(initial[i].path, cacheFile);
-        }
+        };
+
+        const worker = async () => {
+          while (true) {
+            const i = cursor++;
+            if (i >= initial.length) return;
+            if (initial[i].status === 'skipped') continue;
+            await runOne(i);
+          }
+        };
+
+        const lanes = Math.max(1, Math.min(parallel, initial.length || 1));
+        await Promise.all(Array.from({ length: lanes }, () => worker()));
 
         const all = listVerifiedReports(outputDir);
         all.sort((a, b) => (SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]) || a.file.localeCompare(b.file));
@@ -445,7 +483,8 @@ export function App({
     );
   }
 
-  const realTotal = files.reduce((sum, f) => sum + (f.realFindings ?? 0), 0);
+  const realTotal =
+    resumedFindings + files.reduce((sum, f) => sum + (f.realFindings ?? 0), 0);
   const processedCount = files.filter(f =>
     f.status === 'done' || f.status === 'skipped' || f.status === 'error',
   ).length;

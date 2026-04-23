@@ -42,7 +42,7 @@ npm run dev -- scan ../some-repo
 ## Usage
 
 ```text
-probus scan <repo-path> [--effort low|medium|high] [researcher-model] [qa-model]
+probus scan <repo-path> [--effort low|medium|high] [--researchModel slug] [--qaModel slug] [--provider openai|openrouter|anthropic]
 probus view <repo-path>
 ```
 
@@ -65,15 +65,23 @@ Controls how many files the analyst targets:
 
 ### Models
 
-Both model args take any [OpenRouter model slug](https://openrouter.ai/models):
+Pass models as `<provider>/<model>` slugs via `--researchModel` and `--qaModel`:
 
 ```bash
-probus scan ./app --effort medium anthropic/claude-sonnet-4.6 anthropic/claude-opus-4.7
+probus scan ./app --effort medium \
+  --researchModel anthropic/claude-sonnet-4.6 \
+  --qaModel anthropic/claude-opus-4.7
 ```
 
-Defaults:
-- Researcher: `qwen/qwen3.6-plus`
-- QA:         `anthropic/claude-opus-4.7`
+Defaults are picked from whichever `*_API_KEY` env var is set
+(precedence: `OPENROUTER_API_KEY` → `OPENAI_API_KEY` → `ANTHROPIC_API_KEY`);
+use `--provider` to override when multiple keys are present.
+
+| Provider     | Researcher default            | QA default                       |
+| ------------ | ----------------------------- | -------------------------------- |
+| `openrouter` | `openrouter/qwen/qwen3.6-plus` | `openrouter/anthropic/claude-opus-4.7` |
+| `openai`     | `openai/gpt-5.4-mini`          | `openai/gpt-5.4`                       |
+| `anthropic`  | `anthropic/claude-sonnet-4.6`  | `anthropic/claude-opus-4.7`            |
 
 ## Keybindings
 

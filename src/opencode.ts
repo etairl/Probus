@@ -81,6 +81,32 @@ async function getServer(): Promise<ServerHandle> {
   return serverPromise;
 }
 
+/**
+ * Mark the cached server as dead so the next `getServer()` call spawns a fresh
+ * one. Used after we see `fetch failed` / `ECONNRESET` style errors — which
+ * almost always mean the child process exited and any subsequent call against
+ * that cached handle will fail the same way.
+ */
+function invalidateServer(reason: string): void {
+  if (!serverPromise) return;
+  const dead = serverPromise;
+  serverPromise = null;
+  authedProviders.clear();
+  dead.then(h => { try { h.close(); } catch { /* ignore */ } }, () => { /* ignore */ });
+  // eslint-disable-next-line no-console
+  // (silent — callers log the original error and we respawn on next getServer)
+  void reason;
+}
+
+/**
+ * Heuristic: treat network-layer errors as "server dead, respawn". We match on
+ * the canonical undici message (`fetch failed`) plus common socket errors.
+ */
+function isFetchFailure(err: unknown): boolean {
+  const s = String((err as { message?: unknown } | null)?.message ?? err ?? '');
+  return /fetch failed|ECONNRESET|ECONNREFUSED|socket hang up|EPIPE/i.test(s);
+}
+
 /** Shut down the shared opencode server (called on process exit). */
 export async function shutdownOpencode(): Promise<void> {
   if (!serverPromise) return;
@@ -127,60 +153,59 @@ export async function* runOpencodeAgent(opts: {
   log(`\n===== ${new Date().toISOString()} [${stageLabel ?? 'agent'}] model=${providerID}/${modelID} =====`);
   log(`--- prompt ---\n${prompt}\n--- end prompt ---`);
 
-  let server: ServerHandle;
-  try {
-    server = await getServer();
-  } catch (err) {
-    log(`[event] failed to start opencode server: ${String(err)}`);
-    yield { type: 'error', text: `opencode server failed to start: ${String(err)}` };
-    return;
+  // Setup is retryable — if the cached opencode server died, a fetch-layer
+  // failure here (getServer / auth / session.create / subscribe) is almost
+  // always transient: we invalidate the handle so the next call respawns,
+  // and try once more before giving up.
+  let setup: { client: OpencodeClient; sessionID: string; eventStream: AsyncIterable<unknown> } | null = null;
+  {
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const server = await getServer();
+        const c = server.client;
+        await ensureAuth(c, providerID, apiKey);
+        const created = await c.session.create({ query: { directory: cwd }, body: {} });
+        const id = (created.data as { id?: string } | undefined)?.id;
+        if (!id) throw new Error('session.create returned no id');
+        const sub = await c.event.subscribe({ query: { directory: cwd }, parseAs: 'stream' }) as unknown as { stream: AsyncIterable<unknown> };
+        setup = { client: c, sessionID: id, eventStream: sub.stream };
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (attempt === 0 && isFetchFailure(err)) {
+          log(`[event] setup fetch failed — respawning opencode server: ${String(err)}`);
+          invalidateServer('fetch failed during setup');
+          continue;
+        }
+        break;
+      }
+    }
+    if (!setup) {
+      log(`[event] setup failed: ${String(lastErr)}`);
+      yield { type: 'error', text: `opencode setup failed: ${String(lastErr)}` };
+      return;
+    }
   }
-  const { client } = server;
+  const { client, sessionID, eventStream } = setup;
 
-  try {
-    await ensureAuth(client, providerID, apiKey);
-  } catch (err) {
-    log(`[event] auth failed: ${String(err)}`);
-    yield { type: 'error', text: `auth failed: ${String(err)}` };
-    return;
-  }
-
-  // One session per agent call so cwd / context are isolated.
-  let sessionID: string;
-  try {
-    const created = await client.session.create({ query: { directory: cwd }, body: {} });
-    const id = (created.data as { id?: string } | undefined)?.id;
-    if (!id) throw new Error(`session.create returned no id`);
-    sessionID = id;
-  } catch (err) {
-    log(`[event] session.create failed: ${String(err)}`);
-    yield { type: 'error', text: `session.create failed: ${String(err)}` };
-    return;
-  }
-
-  // Subscribe to events filtered to our session before kicking off the prompt.
-  let eventStream: AsyncIterable<unknown>;
-  try {
-    const sub = await client.event.subscribe({ query: { directory: cwd }, parseAs: 'stream' }) as unknown as { stream: AsyncIterable<unknown> };
-    eventStream = sub.stream;
-  } catch (err) {
-    log(`[event] subscribe failed: ${String(err)}`);
-    yield { type: 'error', text: `event subscribe failed: ${String(err)}` };
-    return;
-  }
-
-  // Fire the prompt (don't await — we consume events until idle).
-  const promptPromise = client.session.prompt({
+  // Fire the prompt. We don't `await` it up-front because we want to drain
+  // the event stream in parallel. But we *do* track its resolution — when
+  // `session.prompt` returns, the HTTP call is done and the assistant has
+  // finished responding. That's our backstop in case `session.idle` never
+  // arrives (observed in practice with some openrouter models).
+  type PromptResult = { error: unknown } | undefined;
+  const promptPromise: Promise<PromptResult> = client.session.prompt({
     path: { id: sessionID },
     query: { directory: cwd },
     body: {
       model: { providerID, modelID },
       parts: [{ type: 'text', text: prompt }],
     },
-  }).catch((err) => {
-    log(`[event] prompt error: ${String(err)}`);
-    return { error: err };
-  });
+  }).then(
+    () => undefined,
+    (err) => { log(`[event] prompt error: ${String(err)}`); return { error: err }; },
+  );
 
   let aborted = false;
   const onAbort = () => { aborted = true; };
@@ -190,61 +215,120 @@ export async function* runOpencodeAgent(opts: {
   // running text each update; we subtract the last snapshot to produce a delta).
   const textSnapshots = new Map<string, string>();
 
+  // `processEvent` classifies a single raw event and returns (a) chunks to
+  // stream upstream, and (b) an optional stop signal. We can't yield from
+  // inside a nested function, so we collect the yields and emit them in the
+  // outer loop. Returns null for events we ignore.
+  type Processed = {
+    chunks: string[];
+    stop?: 'idle' | 'error';
+    errorText?: string;
+  };
+  const processEvent = (raw: unknown): Processed => {
+    const evt = raw as {
+      type?: string;
+      properties?: {
+        part?: { id?: string; type?: string; text?: string; tool?: string; sessionID?: string };
+        info?: { id?: string; error?: unknown };
+        sessionID?: string;
+        delta?: string;
+      };
+    };
+
+    const partSession = evt.properties?.part?.sessionID;
+    const infoSession = evt.properties?.sessionID;
+    const relevant = partSession === sessionID || infoSession === sessionID;
+    const out: Processed = { chunks: [] };
+
+    if (evt.type === 'message.part.updated' && relevant && evt.properties?.part) {
+      const part = evt.properties.part;
+      if (part.type === 'reasoning' && part.id && typeof part.text === 'string') {
+        const prev = textSnapshots.get(part.id) ?? '';
+        const delta = part.text.slice(prev.length);
+        textSnapshots.set(part.id, part.text);
+        if (delta) {
+          log(`[reasoning] ${delta}`);
+          out.chunks.push(delta);
+        }
+      } else if (part.type === 'text' && part.id && typeof part.text === 'string') {
+        const prev = textSnapshots.get(part.id) ?? '';
+        const delta = part.text.slice(prev.length);
+        textSnapshots.set(part.id, part.text);
+        if (delta) log(`[text] ${delta}`);
+      } else if (part.type === 'tool' && part.tool) {
+        log(`[tool_use] ${part.tool}`);
+      }
+    } else if (evt.type === 'session.error' && relevant) {
+      const msg = String((evt.properties?.info as { error?: unknown } | undefined)?.error ?? 'unknown session error');
+      log(`[event] session.error ${msg}`);
+      out.stop = 'error';
+      out.errorText = msg;
+    } else if (evt.type === 'session.idle' && relevant) {
+      log('[event] session.idle');
+      out.stop = 'idle';
+    }
+    return out;
+  };
+
+  // Race events against prompt-done so we can't hang if session.idle never
+  // fires. Pull events through a manual iterator so we can use Promise.race.
+  const iter = (eventStream as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+  const promptDoneSentinel = Symbol('prompt-done');
+  type Next = IteratorResult<unknown> | typeof promptDoneSentinel;
+
   try {
-    for await (const raw of eventStream) {
+    while (true) {
       if (aborted) {
         log('[event] aborted');
         yield { type: 'skipped' };
         return;
       }
 
-      const evt = raw as {
-        type?: string;
-        properties?: {
-          part?: { id?: string; type?: string; text?: string; tool?: string; sessionID?: string };
-          info?: { id?: string; error?: unknown };
-          sessionID?: string;
-          delta?: string;
-        };
-      };
+      const next = (await Promise.race([
+        iter.next(),
+        promptPromise.then(() => promptDoneSentinel),
+      ])) as Next;
 
-      const partSession = evt.properties?.part?.sessionID;
-      const infoSession = evt.properties?.sessionID;
-      const relevant = partSession === sessionID || infoSession === sessionID;
-
-      if (evt.type === 'message.part.updated' && relevant && evt.properties?.part) {
-        const part = evt.properties.part;
-        // Opencode streams `text` (final assistant output — usually structured
-        // JSON/XML whose tail line is junk like `</output>`) and `reasoning`
-        // (chain-of-thought). We only surface `reasoning` to the UI so the
-        // "last line" thinking display isn't polluted by closing tags. `text`
-        // content still lands on disk via tool calls that the agent makes.
-        if (part.type === 'reasoning' && part.id && typeof part.text === 'string') {
-          const prev = textSnapshots.get(part.id) ?? '';
-          const delta = part.text.slice(prev.length);
-          textSnapshots.set(part.id, part.text);
-          if (delta) {
-            log(`[reasoning] ${delta}`);
-            yield { type: 'chunk', text: delta };
-          }
-        } else if (part.type === 'text' && part.id && typeof part.text === 'string') {
-          // Log-only, don't stream to UI.
-          const prev = textSnapshots.get(part.id) ?? '';
-          const delta = part.text.slice(prev.length);
-          textSnapshots.set(part.id, part.text);
-          if (delta) log(`[text] ${delta}`);
-        } else if (part.type === 'tool' && part.tool) {
-          log(`[tool_use] ${part.tool}`);
+      if (next === promptDoneSentinel) {
+        // Prompt HTTP call finished. Peek at the result: if it errored, skip
+        // the drain and let the post-loop error handler surface it; if it
+        // succeeded, drain the stream briefly to pick up any final parts
+        // buffered just before session.idle.
+        const peek = await promptPromise;
+        if (peek && typeof peek === 'object' && 'error' in peek) {
+          log(`[event] prompt settled with error: ${String(peek.error)}`);
+          break;
         }
-      } else if (evt.type === 'session.error' && relevant) {
-        const msg = String((evt.properties?.info as { error?: unknown } | undefined)?.error ?? 'unknown session error');
-        log(`[event] session.error ${msg}`);
-        yield { type: 'error', text: msg };
-        return;
-      } else if (evt.type === 'session.idle' && relevant) {
-        log('[event] session.idle');
+        log('[event] prompt settled — draining tail events');
+        const drainDeadline = Date.now() + 500;
+        while (Date.now() < drainDeadline) {
+          const remaining = drainDeadline - Date.now();
+          if (remaining <= 0) break;
+          const tail = await Promise.race([
+            iter.next(),
+            new Promise<null>(r => setTimeout(() => r(null), remaining)),
+          ]);
+          if (tail === null) break;
+          if (tail.done) break;
+          const p = processEvent(tail.value);
+          for (const c of p.chunks) yield { type: 'chunk', text: c };
+          if (p.stop) break;
+        }
         break;
       }
+
+      if (next.done) {
+        log('[event] event stream ended');
+        break;
+      }
+
+      const p = processEvent(next.value);
+      for (const c of p.chunks) yield { type: 'chunk', text: c };
+      if (p.stop === 'error') {
+        yield { type: 'error', text: p.errorText ?? 'unknown session error' };
+        return;
+      }
+      if (p.stop === 'idle') break;
     }
   } finally {
     signal?.removeEventListener('abort', onAbort);
@@ -252,6 +336,11 @@ export async function* runOpencodeAgent(opts: {
 
   const res = await promptPromise;
   if (res && typeof res === 'object' && 'error' in res) {
+    // If the prompt itself died at the fetch layer, the server handle is
+    // almost certainly dead too — invalidate so the next file respawns.
+    if (isFetchFailure((res as { error: unknown }).error)) {
+      invalidateServer('fetch failed during prompt');
+    }
     yield { type: 'error', text: String((res as { error: unknown }).error) };
     return;
   }

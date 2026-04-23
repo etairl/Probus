@@ -34,6 +34,7 @@ switch (parsed.kind) {
         qaModel={parsed.qaModel}
         effort={parsed.effort}
         preferredProvider={parsed.preferredProvider}
+        parallel={parsed.parallel}
       />,
     );
     break;
