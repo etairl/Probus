@@ -77,7 +77,18 @@ use `--provider` to override when multiple keys are present.
 
 ## Cost
 
-Cost is distributed between two models. The primary model takes 90% of token consumption and should be cheap & less intelligent (e.g. qwen 3.6, gpt-5.4-mini, sonnet-4.6). The secondary model takes 10% of token consumption and should be more expensive & more intelligent (e.g. deepseek-v4-pro, gpt-5.4, opus-4.7). Processing each file costs about 1M input tokens and using the open models cost around $0.5. When using Anthropic provider, cost jumps by ~10x. When using openai, cost jumps by ~2.5x.
+Probus splits work between two models so you only pay premium rates where it matters:
+
+- **Primary** (~90% of tokens) — runs on every file. Pick something cheap and fast: `qwen3.6`, `gpt-5.4-mini`, `sonnet-4.6`.
+- **Secondary** (~10% of tokens) — verifies findings. Pick something smarter: `deepseek-v4-pro`, `gpt-5.4`, `opus-4.7`.
+
+Each file consumes roughly **1M input tokens**. Approximate per-file cost by provider:
+
+| Provider     | Cost / file | vs. open models |
+| ------------ | ----------- | --------------- |
+| `openrouter` (open models) | ~$0.50  | 1× (baseline)   |
+| `openai`                   | ~$1.25  | ~2.5×           |
+| `anthropic`                | ~$5.00  | ~10×            |
 
 ## Contributing
 
