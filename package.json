@@ -1,6 +1,6 @@
 {
   "name": "probus",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agentic security scanner for code repos — analyst + primary + secondary agent pipeline over OpenRouter / OpenAI / Anthropic models, with a live Ink terminal UI.",
   "type": "module",
   "license": "Apache-2.0",
