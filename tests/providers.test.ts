@@ -16,9 +16,9 @@ describe('splitModel', () => {
   });
 
   it('keeps nested model ids intact (openrouter style)', () => {
-    const r = splitModel('openrouter/qwen/qwen3.6-plus');
+    const r = splitModel('openrouter/qwen/qwen3.7-plus');
     expect(r.providerID).toBe('openrouter');
-    expect(r.modelID).toBe('qwen/qwen3.6-plus');
+    expect(r.modelID).toBe('qwen/qwen3.7-plus');
   });
 
   it('throws on missing slash', () => {
@@ -61,8 +61,8 @@ describe('detectProvider', () => {
 describe('defaultModels', () => {
   it('returns openrouter defaults', () => {
     const d = defaultModels('openrouter');
-    expect(d.primary).toBe('openrouter/qwen/qwen3.6-plus');
-    expect(d.secondary).toBe('openrouter/deepseek/deepseek-v4-pro');
+    expect(d.primary).toBe('openrouter/qwen/qwen3.7-plus');
+    expect(d.secondary).toBe('openrouter/z-ai/glm-5.2');
   });
 
   it('returns openai defaults', () => {

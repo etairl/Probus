@@ -61,7 +61,7 @@ When you don't pass model overrides, these are the picks:
 
 | Provider     | Primary default                | Secondary default                     |
 | ------------ | ------------------------------ | ------------------------------------- |
-| `openrouter` | `openrouter/qwen/qwen3.6-plus` | `openrouter/deepseek/deepseek-v4-pro` |
+| `openrouter` | `openrouter/qwen/qwen3.7-plus`  | `openrouter/z-ai/glm-5.2`             |
 | `openai`     | `openai/gpt-5.4-mini`          | `openai/gpt-5.4`                      |
 | `anthropic`  | `anthropic/claude-sonnet-4-6`  | `anthropic/claude-opus-4-7`           |
 
@@ -79,8 +79,8 @@ Each scan picks an effort level that caps the number of files the analyst target
 
 Probus splits work between two models so you only pay premium rates where it matters:
 
-- **Primary** (~90% of tokens) — runs on every file. Pick something cheap and fast: `qwen3.6`, `gpt-5.4-mini`, `sonnet-4.6`.
-- **Secondary** (~10% of tokens) — verifies findings. Pick something smarter: `deepseek-v4-pro`, `gpt-5.4`, `opus-4.7`.
+- **Primary** (~90% of tokens) — runs on every file. Pick something cheap and fast: `qwen3.7-plus`, `gpt-5.4-mini`, `sonnet-4.6`.
+- **Secondary** (~10% of tokens) — verifies findings. Pick something smarter: `glm-5.2`, `qwen3.7-max`, `gpt-5.4`, `opus-4.7`.
 
 Each file consumes roughly **1M input tokens**. Approximate per-file cost by provider:
 

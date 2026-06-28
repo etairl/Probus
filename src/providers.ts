@@ -22,7 +22,7 @@ export interface ParsedModel {
 /**
  * Split `"openai/gpt-5"` → `{ providerID: "openai", modelID: "gpt-5" }`.
  * Everything after the first slash is the model ID (OpenRouter slugs like
- * `openrouter/qwen/qwen3.6-plus` keep the nested provider in modelID).
+ * `openrouter/qwen/qwen3.7-plus` keep the nested provider in modelID).
  */
 export function splitModel(slug: string): ParsedModel {
   const idx = slug.indexOf('/');
@@ -67,8 +67,8 @@ export function defaultModels(provider: KnownProvider): ModelDefaults {
   switch (provider) {
     case 'openrouter':
       return {
-        primary: 'openrouter/qwen/qwen3.6-plus',
-        secondary: 'openrouter/deepseek/deepseek-v4-pro',
+        primary: 'openrouter/qwen/qwen3.7-plus',
+        secondary: 'openrouter/z-ai/glm-5.2',
       };
     case 'openai':
       return {
