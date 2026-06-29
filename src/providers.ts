@@ -73,12 +73,12 @@ export function defaultModels(provider: KnownProvider): ModelDefaults {
     case 'openai':
       return {
         primary: 'openai/gpt-5.4-mini',
-        secondary: 'openai/gpt-5.4',
+        secondary: 'openai/gpt-5.5',
       };
     case 'anthropic':
       return {
         primary: 'anthropic/claude-sonnet-4-6',
-        secondary: 'anthropic/claude-opus-4-7',
+        secondary: 'anthropic/claude-opus-4-8',
       };
   }
 }

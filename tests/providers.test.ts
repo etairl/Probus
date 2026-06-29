@@ -68,7 +68,7 @@ describe('defaultModels', () => {
   it('returns openai defaults', () => {
     const d = defaultModels('openai');
     expect(d.primary).toBe('openai/gpt-5.4-mini');
-    expect(d.secondary).toBe('openai/gpt-5.4');
+    expect(d.secondary).toBe('openai/gpt-5.5');
   });
 
   it('returns anthropic defaults', () => {
